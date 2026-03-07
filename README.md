@@ -1,11 +1,11 @@
 
-# REK - Reconnaissance Toolkit
+# REK_MCP_Server - Reconnaissance Toolkit
 
 **A Modern Recon Playbook for Bug Bounty Hunters**
 
 REK is a comprehensive reconnaissance toolkit designed for ethical hackers and bug bounty hunters. It provides automated reconnaissance pipelines through sophisticated playbooks, along with modular subdomain enumeration, HTTP status checking, directory scanning, and email search capabilities.
 
-**Authors:** Jayresearcher, NarutoX, Ninja
+**Authors:** Jayresearcher, NarutoX, Ninja, N00B-LMS
 
 ## 🚀 Automated Playbook System
 
