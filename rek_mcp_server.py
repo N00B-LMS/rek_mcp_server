@@ -551,11 +551,12 @@ async def process_request(request: dict) -> dict | None:
             }
 
     else:
-        return {
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "error": {"code": -32601, "message": f"Method not found: {method}"}
-        }
+        # Notifications (no id) are silently ignored
+        if req_id is None:
+            return None
+        # Claude Desktop's validator rejects error-format responses;
+        # return an empty result so the client isn't left waiting
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
 
 
 def _error_response(req_id: Any, code: int, message: str) -> dict:
@@ -593,16 +594,15 @@ async def run_stdio() -> None:
 
         try:
             request = json.loads(line)
-        except json.JSONDecodeError as e:
-            _stdio_send(_error_response(None, -32700, f"Parse error: {e}"))
-            continue
+        except json.JSONDecodeError:
+            continue  # drop unparseable lines; sending error-format upsets Claude Desktop
 
         try:
             response = await process_request(request)
             if response is not None:
                 _stdio_send(response)
-        except Exception as e:
-            _stdio_send(_error_response(request.get("id"), -32603, f"Internal error: {e}"))
+        except Exception:
+            pass  # swallow to avoid sending error-format responses
 
 
 # ---------------------------------------------------------------------------
