@@ -24,17 +24,51 @@ import io
 import os
 import contextlib
 import logging
+import logging.handlers
 import argparse
 import uuid
+import functools
 from typing import Any
 
-# Suppress all warnings/logging so they don't corrupt StdIO JSON stream
+# Suppress all warnings so they don't corrupt StdIO JSON stream
 import warnings
 warnings.filterwarnings("ignore")
-logging.disable(logging.CRITICAL)
 
 # Ensure REK modules are importable from the same directory
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _SERVER_DIR)
+
+# ---------------------------------------------------------------------------
+# File logger (safe to use in all transports — never writes to stdout)
+# ---------------------------------------------------------------------------
+
+_LOG_PATH = os.path.join(_SERVER_DIR, "logs", "rek_mcp_server.log")
+os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
+
+_log = logging.getLogger("rek_mcp_server")
+_log.setLevel(logging.DEBUG)
+_log.propagate = False  # isolated — won't reach root logger or stdout
+
+_fh = logging.handlers.RotatingFileHandler(
+    _LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+)
+_fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+_log.addHandler(_fh)
+
+# Suppress root logger (and all rek module loggers) without a process-wide
+# disable that would also kill our file logger above
+logging.getLogger().setLevel(logging.CRITICAL + 1)
+
+
+# Redirect sys.stderr to the log file so nothing leaks to the StdIO stream
+class _StderrToLog:
+    def write(self, msg: str) -> None:
+        msg = msg.strip()
+        if msg:
+            _log.warning("[stderr] %s", msg)
+
+    def flush(self) -> None:
+        pass
 
 # ---------------------------------------------------------------------------
 # Tool definitions (MCP schema)
@@ -211,8 +245,12 @@ TOOLS = [
     {
         "name": "run_playbook",
         "description": (
-            "Run an automated multi-phase reconnaissance playbook against a target domain. "
-            "Phases include subdomain enumeration, HTTP probing, port scanning, JS analysis, and reporting. "
+            "Run ONE automated reconnaissance playbook against a target domain. "
+            "Three independent playbooks are available — each must be called separately: "
+            "'v1' (advanced: subdomain enum, HTTP probing, port scanning, JS analysis, reporting), "
+            "'v2' (URL crawler: focused on crawling and URL discovery), "
+            "'standard' (baseline recon pipeline). "
+            "To run all three, call this tool three times with version='v1', 'v2', and 'standard' respectively. "
             "Requires bash and external tools installed via install-script.sh."
         ),
         "inputSchema": {
@@ -398,17 +436,21 @@ async def tool_search_emails(args: dict) -> str:
 
     searcher = EmailSearcher(timeout=10, silent=True)
 
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-        searcher.run(
-            domain=args.get("email_domain"),
-            username=username,
-            token=args.get("token"),
-            output_file=output_file,
-            max_commits=args.get("limit_commits", 50),
-            skip_forks=args.get("skip_forks", True),
-            hibp_key=args.get("hibp_key")
-        )
+    def _run():
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            searcher.run(
+                domain=args.get("email_domain"),
+                username=username,
+                token=args.get("token"),
+                output_file=output_file,
+                max_commits=args.get("limit_commits", 50),
+                skip_forks=args.get("skip_forks", True),
+                hibp_key=args.get("hibp_key")
+            )
+
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _run)
 
     return (
         f"Email search complete.\n"
@@ -428,8 +470,7 @@ async def tool_run_playbook(args: dict) -> str:
         "standard": "playbook/rek-playbook.sh"
     }
     playbook = playbook_map.get(version, "playbook/rek-playbook-v1.sh")
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    playbook_path = os.path.join(script_dir, playbook)
+    playbook_path = os.path.join(_SERVER_DIR, playbook)
 
     if not os.path.exists(playbook_path):
         return f"Error: Playbook not found at {playbook_path}"
@@ -449,7 +490,7 @@ async def tool_run_playbook(args: dict) -> str:
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            cwd=script_dir
+            cwd=_SERVER_DIR
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3600)
         output = stdout.decode("utf-8", errors="replace")
@@ -489,6 +530,7 @@ async def process_request(request: dict) -> dict | None:
     req_id = request.get("id")
     method = request.get("method", "")
     params = request.get("params") or {}
+    _log.debug(">> %s  id=%s", method, req_id)
 
     if method == "initialize":
         requested = params.get("protocolVersion", DEFAULT_VERSION)
@@ -532,7 +574,9 @@ async def process_request(request: dict) -> dict | None:
             }
 
         try:
+            _log.info("CALL %s  args=%s", tool_name, arguments)
             result_text = await handler(arguments)
+            _log.info("DONE %s", tool_name)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -541,6 +585,7 @@ async def process_request(request: dict) -> dict | None:
                 }
             }
         except Exception as e:
+            _log.exception("ERROR in tool %s: %s", tool_name, e)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -577,7 +622,9 @@ async def _stdio_readline(loop: asyncio.AbstractEventLoop) -> str | None:
 
 
 async def run_stdio() -> None:
-    loop = asyncio.get_event_loop()
+    sys.stderr = _StderrToLog()  # capture all stderr into the log file
+    _log.info("=== REK MCP Server started (StdIO) ===")
+    loop = asyncio.get_running_loop()
 
     while True:
         try:
@@ -594,15 +641,16 @@ async def run_stdio() -> None:
 
         try:
             request = json.loads(line)
-        except json.JSONDecodeError:
-            continue  # drop unparseable lines; sending error-format upsets Claude Desktop
+        except json.JSONDecodeError as e:
+            _log.warning("Parse error (line dropped): %s", e)
+            continue
 
         try:
             response = await process_request(request)
             if response is not None:
                 _stdio_send(response)
-        except Exception:
-            pass  # swallow to avoid sending error-format responses
+        except Exception as e:
+            _log.exception("Unhandled error processing request: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -616,11 +664,7 @@ def run_http(host: str, port: int) -> None:
         from sse_starlette.sse import EventSourceResponse
         import uvicorn
     except ImportError:
-        print(
-            "HTTP mode requires additional packages:\n"
-            "  pip install fastapi \"uvicorn[standard]\" sse-starlette",
-            file=sys.stderr
-        )
+        _log.error("HTTP mode requires: pip install fastapi \"uvicorn[standard]\" sse-starlette")
         sys.exit(1)
 
     app = FastAPI(title="REK MCP Server")
@@ -677,7 +721,11 @@ def run_http(host: str, port: int) -> None:
             if response is not None:
                 await queue.put(response)
         except Exception as e:
-            await queue.put(_error_response(body.get("id"), -32603, str(e)))
+            _log.exception("SSE handler error: %s", e)
+            await queue.put({
+                "jsonrpc": "2.0", "id": body.get("id"),
+                "result": {"content": [{"type": "text", "text": str(e)}], "isError": True}
+            })
 
         return Response(status_code=202)
 
@@ -733,10 +781,10 @@ def run_http(host: str, port: int) -> None:
 
         return JSONResponse(content=response)
 
-    print(f"REK MCP Server (HTTP) running on http://{host}:{port}")
-    print(f"  SSE transport:              GET  http://{host}:{port}/sse")
-    print(f"  SSE messages:               POST http://{host}:{port}/messages")
-    print(f"  Streamable HTTP transport:  POST http://{host}:{port}/mcp")
+    _log.info("=== REK MCP Server started (HTTP) on %s:%s ===", host, port)
+    _log.info("  SSE transport:             GET  http://%s:%s/sse", host, port)
+    _log.info("  SSE messages:              POST http://%s:%s/messages", host, port)
+    _log.info("  Streamable HTTP transport: POST http://%s:%s/mcp", host, port)
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
