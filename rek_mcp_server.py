@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
 """
 REK MCP Server
-Exposes REK reconnaissance capabilities as MCP tools over StdIO (JSON-RPC 2.0).
-Compatible with any local MCP client (Ollama + Open WebUI, LM Studio, Jan, Msty, etc.)
+Exposes REK reconnaissance capabilities as MCP tools over three transports:
+
+  StdIO (default)       — JSON-RPC 2.0 over stdin/stdout
+  SSE (--http)          — GET /sse  +  POST /messages   (MCP 2024-11-05)
+  Streamable HTTP (--http) — POST /mcp                  (MCP 2025-03-26)
 
 Usage:
-    python3 rek_mcp_server.py
+    python3 rek_mcp_server.py                        # StdIO
+    python3 rek_mcp_server.py --http                 # HTTP on 0.0.0.0:8000
+    python3 rek_mcp_server.py --http --port 3000     # HTTP on custom port
+    python3 rek_mcp_server.py --http --host 127.0.0.1 --port 3000
 
-Configure your local LLM client to launch this as an MCP StdIO server.
+HTTP dependencies (not required for StdIO):
+    pip install fastapi "uvicorn[standard]" sse-starlette
 """
 
 import sys
@@ -16,8 +23,9 @@ import asyncio
 import io
 import os
 import contextlib
-import subprocess
 import logging
+import argparse
+import uuid
 from typing import Any
 
 # Suppress all warnings/logging so they don't corrupt StdIO JSON stream
@@ -250,20 +258,6 @@ TOOLS = [
 ]
 
 # ---------------------------------------------------------------------------
-# StdIO helpers
-# ---------------------------------------------------------------------------
-
-def send(obj: dict) -> None:
-    """Write a JSON object as a newline-delimited message to stdout."""
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
-
-
-def send_error(req_id: Any, code: int, message: str) -> None:
-    send({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}})
-
-
-# ---------------------------------------------------------------------------
 # Tool handlers
 # ---------------------------------------------------------------------------
 
@@ -324,9 +318,18 @@ async def tool_check_http_status(args: dict) -> str:
         silent=True
     )
 
+    if not os.path.exists(input_file):
+        return f"Error: input file not found: {input_file}"
+
+    with open(input_file, "r", encoding="utf-8") as f:
+        urls = [line.strip() for line in f if line.strip()]
+
+    if not urls:
+        return "No URLs found in input file."
+
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-        checker.run(input_file, output_file)
+        await checker.check_all_urls(urls, output_file)
 
     return (
         f"HTTP status check complete.\n"
@@ -353,9 +356,23 @@ async def tool_scan_directories(args: dict) -> str:
     if args.get("status_codes"):
         status_codes = [int(c.strip()) for c in args["status_codes"].split(",")]
 
+    wordlist = scanner.load_wordlist(dir_wordlist)
+
+    if status_codes and input_file:
+        urls = scanner.read_urls_by_status(input_file, status_codes)
+    elif url:
+        urls = [url]
+    else:
+        return "Error: must provide either a url or an input_file with status_codes."
+
+    if not urls:
+        return "No URLs to scan."
+
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-        scanner.run(input_file, status_codes, url, dir_wordlist)
+        await scanner.scan_all_urls(urls, wordlist)
+
+    scanner.save_results()
 
     lines = [
         "Directory scan complete.",
@@ -436,7 +453,6 @@ async def tool_run_playbook(args: dict) -> str:
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3600)
         output = stdout.decode("utf-8", errors="replace")
-        # Return last 5000 chars to avoid overwhelming the LLM context
         tail = output[-5000:] if len(output) > 5000 else output
         return (
             f"Playbook '{version}' finished for {domain} (exit code {proc.returncode}).\n\n"
@@ -460,40 +476,45 @@ HANDLERS = {
     "run_playbook":         tool_run_playbook,
 }
 
-
 # ---------------------------------------------------------------------------
-# MCP JSON-RPC 2.0 server loop
+# Transport-agnostic request processor
 # ---------------------------------------------------------------------------
 
-async def handle_request(request: dict) -> None:
+SUPPORTED_VERSIONS = {"2024-11-05", "2025-03-26"}
+DEFAULT_VERSION = "2024-11-05"
+
+
+async def process_request(request: dict) -> dict | None:
+    """Process one JSON-RPC 2.0 MCP request. Returns a response dict or None (notifications)."""
     req_id = request.get("id")
     method = request.get("method", "")
     params = request.get("params") or {}
 
     if method == "initialize":
-        send({
+        requested = params.get("protocolVersion", DEFAULT_VERSION)
+        version = requested if requested in SUPPORTED_VERSIONS else DEFAULT_VERSION
+        return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": version,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "rek_mcp_server", "version": "1.0.0"}
             }
-        })
+        }
 
     elif method == "initialized":
-        # Notification — no response
-        pass
+        return None  # notification, no response
 
     elif method == "ping":
-        send({"jsonrpc": "2.0", "id": req_id, "result": {}})
+        return {"jsonrpc": "2.0", "id": req_id, "result": {}}
 
     elif method == "tools/list":
-        send({
+        return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {"tools": TOOLS}
-        })
+        }
 
     elif method == "tools/call":
         tool_name = params.get("name", "")
@@ -501,50 +522,65 @@ async def handle_request(request: dict) -> None:
         handler = HANDLERS.get(tool_name)
 
         if handler is None:
-            send({
+            return {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
                     "content": [{"type": "text", "text": f"Unknown tool: {tool_name}"}],
                     "isError": True
                 }
-            })
-            return
+            }
 
         try:
             result_text = await handler(arguments)
-            send({
+            return {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
                     "content": [{"type": "text", "text": result_text}]
                 }
-            })
+            }
         except Exception as e:
-            send({
+            return {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {
                     "content": [{"type": "text", "text": f"Tool execution error: {e}"}],
                     "isError": True
                 }
-            })
+            }
 
     else:
-        send_error(req_id, -32601, f"Method not found: {method}")
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"}
+        }
 
 
-async def readline_async(loop: asyncio.AbstractEventLoop) -> str | None:
-    """Read one line from stdin without blocking the event loop (Windows-compatible)."""
+def _error_response(req_id: Any, code: int, message: str) -> dict:
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
+
+
+# ---------------------------------------------------------------------------
+# StdIO transport
+# ---------------------------------------------------------------------------
+
+def _stdio_send(obj: dict) -> None:
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+async def _stdio_readline(loop: asyncio.AbstractEventLoop) -> str | None:
     return await loop.run_in_executor(None, sys.stdin.readline)
 
 
-async def main() -> None:
+async def run_stdio() -> None:
     loop = asyncio.get_event_loop()
 
     while True:
         try:
-            line = await readline_async(loop)
+            line = await _stdio_readline(loop)
         except Exception:
             break
 
@@ -558,14 +594,173 @@ async def main() -> None:
         try:
             request = json.loads(line)
         except json.JSONDecodeError as e:
-            send_error(None, -32700, f"Parse error: {e}")
+            _stdio_send(_error_response(None, -32700, f"Parse error: {e}"))
             continue
 
         try:
-            await handle_request(request)
+            response = await process_request(request)
+            if response is not None:
+                _stdio_send(response)
         except Exception as e:
-            send_error(request.get("id"), -32603, f"Internal error: {e}")
+            _stdio_send(_error_response(request.get("id"), -32603, f"Internal error: {e}"))
 
+
+# ---------------------------------------------------------------------------
+# HTTP transport — SSE (2024-11-05) + Streamable HTTP (2025-03-26)
+# ---------------------------------------------------------------------------
+
+def run_http(host: str, port: int) -> None:
+    try:
+        from fastapi import FastAPI, Request, Response
+        from fastapi.responses import JSONResponse, StreamingResponse
+        from sse_starlette.sse import EventSourceResponse
+        import uvicorn
+    except ImportError:
+        print(
+            "HTTP mode requires additional packages:\n"
+            "  pip install fastapi \"uvicorn[standard]\" sse-starlette",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    app = FastAPI(title="REK MCP Server")
+
+    # session_id -> asyncio.Queue  (used by SSE transport)
+    sse_sessions: dict[str, asyncio.Queue] = {}
+
+    # ------------------------------------------------------------------ #
+    # SSE transport  (MCP 2024-11-05)                                     #
+    #   GET  /sse       — client subscribes; receives an `endpoint` event  #
+    #   POST /messages  — client sends JSON-RPC; response arrives via SSE  #
+    # ------------------------------------------------------------------ #
+
+    @app.get("/sse")
+    async def sse_connect(request: Request):
+        session_id = str(uuid.uuid4())
+        queue: asyncio.Queue = asyncio.Queue()
+        sse_sessions[session_id] = queue
+
+        async def generator():
+            # Tell the client where to POST its messages
+            yield {
+                "event": "endpoint",
+                "data": f"/messages?sessionId={session_id}"
+            }
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        msg = await asyncio.wait_for(queue.get(), timeout=15)
+                        yield {"data": json.dumps(msg)}
+                    except asyncio.TimeoutError:
+                        yield {"event": "ping", "data": ""}
+            finally:
+                sse_sessions.pop(session_id, None)
+
+        return EventSourceResponse(generator())
+
+    @app.post("/messages")
+    async def sse_message(request: Request):
+        session_id = request.query_params.get("sessionId", "")
+        queue = sse_sessions.get(session_id)
+        if queue is None:
+            return Response(status_code=404, content="Session not found")
+
+        try:
+            body = await request.json()
+        except Exception:
+            return Response(status_code=400, content="Invalid JSON")
+
+        try:
+            response = await process_request(body)
+            if response is not None:
+                await queue.put(response)
+        except Exception as e:
+            await queue.put(_error_response(body.get("id"), -32603, str(e)))
+
+        return Response(status_code=202)
+
+    # ------------------------------------------------------------------ #
+    # Streamable HTTP transport  (MCP 2025-03-26)                         #
+    #   POST /mcp — single endpoint for all JSON-RPC traffic              #
+    #   Responds with JSON or SSE stream depending on Accept header        #
+    # ------------------------------------------------------------------ #
+
+    @app.post("/mcp")
+    async def streamable_http(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse(
+                status_code=400,
+                content=_error_response(None, -32700, "Parse error")
+            )
+
+        wants_sse = "text/event-stream" in request.headers.get("accept", "")
+
+        # Batch request
+        if isinstance(body, list):
+            responses = []
+            for req in body:
+                try:
+                    resp = await process_request(req)
+                    if resp is not None:
+                        responses.append(resp)
+                except Exception as e:
+                    responses.append(_error_response(req.get("id"), -32603, str(e)))
+
+            if wants_sse:
+                async def batch_stream():
+                    for r in responses:
+                        yield f"data: {json.dumps(r)}\n\n"
+                return StreamingResponse(batch_stream(), media_type="text/event-stream")
+            return JSONResponse(content=responses)
+
+        # Single request
+        try:
+            response = await process_request(body)
+        except Exception as e:
+            response = _error_response(body.get("id"), -32603, str(e))
+
+        if response is None:
+            return Response(status_code=202)  # notification acknowledged
+
+        if wants_sse:
+            async def single_stream():
+                yield f"data: {json.dumps(response)}\n\n"
+            return StreamingResponse(single_stream(), media_type="text/event-stream")
+
+        return JSONResponse(content=response)
+
+    print(f"REK MCP Server (HTTP) running on http://{host}:{port}")
+    print(f"  SSE transport:              GET  http://{host}:{port}/sse")
+    print(f"  SSE messages:               POST http://{host}:{port}/messages")
+    print(f"  Streamable HTTP transport:  POST http://{host}:{port}/mcp")
+    uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="REK MCP Server")
+    parser.add_argument(
+        "--http", action="store_true",
+        help="Run HTTP server (SSE + Streamable HTTP) instead of StdIO"
+    )
+    parser.add_argument(
+        "--host", default="0.0.0.0",
+        help="HTTP bind host (default: 0.0.0.0)"
+    )
+    parser.add_argument(
+        "--port", type=int, default=8000,
+        help="HTTP port (default: 8000)"
+    )
+    args = parser.parse_args()
+
+    if args.http:
+        run_http(args.host, args.port)
+    else:
+        asyncio.run(run_stdio())
