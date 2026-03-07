@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 import requests
 import argparse
+import csv
 import os
 import re
 import logging
 from typing import List, Dict
 
-EMAIL_REGEX = r"[a-zA-Z0.9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
+EMAIL_REGEX = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
 
 class EmailSearcher:
     def __init__(self, timeout: int = 10, silent: bool = False):
@@ -91,7 +92,10 @@ class EmailSearcher:
                         print(f"⚠️ Search stopped with status {response.status_code}")
                     break
                 data = response.json()
-                for item in data.get("items", []):
+                items = data.get("items", [])
+                if not items:
+                    break
+                for item in items:
                     msg = item.get("commit", {}).get("message", "")
                     commit_url = item.get("html_url", "")
                     found_emails = re.findall(EMAIL_REGEX, msg)
@@ -137,16 +141,33 @@ class EmailSearcher:
                 print(f"❌ Error checking HIBP for {email}: {e}")
             return False, ""
 
+    _FORMULA_CHARS = ("=", "+", "-", "@", "\t", "\r")
+
+    def _sanitize_cell(self, value: str) -> str:
+        """Prefix formula-injection characters to neutralize spreadsheet execution."""
+        s = str(value)
+        if s.startswith(self._FORMULA_CHARS):
+            s = "'" + s
+        return s
+
     def save_results(self, results: List[Dict], output_file: str) -> None:
         """Save email search results to a CSV file."""
         try:
             output_dir = os.path.dirname(output_file)
             if output_dir:
                 os.makedirs(output_dir, exist_ok=True)
-            with open(output_file, "w", encoding="utf-8") as f:
-                f.write("Email,Repo,GitHubUser,Leaked,LeakedSource,CommitURL\n")
+            with open(output_file, "w", encoding="utf-8", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["Email", "Repo", "GitHubUser", "Leaked", "LeakedSource", "CommitURL"])
                 for r in results:
-                    f.write(f"{r['email']},{r['repo']},{r['github_user']},{r['leaked']},{r['leaked_source']},{r['commit_url']}\n")
+                    writer.writerow([
+                        self._sanitize_cell(r["email"]),
+                        self._sanitize_cell(r["repo"]),
+                        self._sanitize_cell(r["github_user"]),
+                        self._sanitize_cell(r["leaked"]),
+                        self._sanitize_cell(r["leaked_source"]),
+                        self._sanitize_cell(r["commit_url"]),
+                    ])
             if not self.silent:
                 print(f"\n✅ Results saved to: {output_file}")
         except Exception as e:

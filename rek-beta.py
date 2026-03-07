@@ -234,11 +234,19 @@ class SubdomainScanner:
             raise
 
         # Step 4: DNS Brute-Forcing on combined wordlist
-        combined_wordlist = list(combined_subdomains)
+        # dns_brute_force expects labels (e.g. "www"), not FQDNs.
+        # Extract labels from discovered FQDNs and union with the original wordlist.
+        domain_suffix = f".{domain}"
+        discovered_labels = {
+            s[: -len(domain_suffix)]
+            for s in self.subdomains
+            if s.endswith(domain_suffix)
+        }
+        combined_labels = list(set(wordlist) | discovered_labels)
         if not self.silent:
-            logger.info(colored(f"Using {len(combined_wordlist)} unique subdomains for DNS validation", "green"))
+            logger.info(colored(f"Using {len(combined_labels)} unique labels for DNS validation", "green"))
         semaphore = asyncio.Semaphore(self.concurrency)
-        await self.dns_brute_force(domain, wordlist, semaphore)
+        await self.dns_brute_force(domain, combined_labels, semaphore)
 
         # Step 5: Save validated subdomains
         validated_output = "results_dns_validated.txt" if not output_file else f"{os.path.splitext(output_file)[0]}_dns_validated.txt"
